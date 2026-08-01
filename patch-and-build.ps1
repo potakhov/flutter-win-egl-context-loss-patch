@@ -75,6 +75,31 @@ function Fail([string]$Message) {
     exit 1
 }
 
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [switch]$Quiet
+    )
+
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        if ($Quiet) {
+            # 2>&1 merges stderr into the success stream so it never reaches the error
+            # stream in the first place.
+            $null = & $FilePath @Arguments 2>&1
+        }
+        else {
+            & $FilePath @Arguments 2>&1 | ForEach-Object { Write-Host $_ }
+        }
+        return $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
 # ---------------------------------------------------------------- validate the SDK tree
 
 Write-Step 'Validating the Flutter SDK'
@@ -150,6 +175,15 @@ if (-not (Test-Path $PatchFile)) {
     Fail "Patch file not found next to this script: $PatchFile"
 }
 Write-Ok "Patch:        $PatchFile"
+
+# Resolve git BEFORE depot_tools goes on PATH. depot_tools ships a git.bat shim that runs
+# git through cmd, which changes how its output is surfaced; asking for git.exe explicitly
+# keeps the patch steps on a plain executable.
+$GitExe = (Get-Command git.exe -ErrorAction SilentlyContinue).Source
+if (-not $GitExe) {
+    Fail 'git.exe was not found on PATH. Install Git for Windows.'
+}
+Write-Ok "Git:          $GitExe"
 
 # ------------------------------------------------------------------- locate the toolchain
 
@@ -240,9 +274,12 @@ else {
     Write-Host '    running gclient sync - first run downloads ~16 GB and takes a while ...'
     Push-Location $FlutterRoot
     try {
-        & (Join-Path $DepotTools 'gclient.bat') sync -D
-        if ($LASTEXITCODE -ne 0) {
-            Fail "gclient sync failed with exit code $LASTEXITCODE"
+        # gclient writes progress and git-config advice to stderr even on success, which
+        # is fatal under Windows PowerShell 5.1 without this wrapper.
+        $syncExit = Invoke-Native -FilePath (Join-Path $DepotTools 'gclient.bat') `
+            -Arguments @('sync', '-D')
+        if ($syncExit -ne 0) {
+            Fail "gclient sync failed with exit code $syncExit"
         }
     }
     finally {
@@ -257,13 +294,23 @@ Write-Step 'Applying the patch'
 
 # --reverse --check succeeds only when the patch is already present, which makes re-runs
 # safe: this script is expected to be run again after a sync failure or an SDK refresh.
-& git -C $FlutterRoot apply --reverse --check $PatchFile 2>$null
-if ($LASTEXITCODE -eq 0) {
+# It is EXPECTED to fail (noisily, on stderr) on an unpatched tree - hence -Quiet and
+# Invoke-Native rather than calling git directly.
+$reverseCheck = Invoke-Native -FilePath $GitExe -Quiet `
+    -Arguments @('-C', $FlutterRoot, 'apply', '--reverse', '--check', $PatchFile)
+
+if ($reverseCheck -eq 0) {
     Write-Ok 'already applied - nothing to do'
 }
 else {
-    & git -C $FlutterRoot apply --check $PatchFile
-    if ($LASTEXITCODE -ne 0) {
+    $forwardCheck = Invoke-Native -FilePath $GitExe -Quiet `
+        -Arguments @('-C', $FlutterRoot, 'apply', '--check', $PatchFile)
+
+    if ($forwardCheck -ne 0) {
+        # Re-run without -Quiet so the actual conflict is visible before we stop.
+        Write-Warn 'git reported:'
+        $null = Invoke-Native -FilePath $GitExe `
+            -Arguments @('-C', $FlutterRoot, 'apply', '--check', $PatchFile)
         Fail @"
 The patch does not apply cleanly to this SDK.
 Most likely the SDK version differs from $ExpectedVersion. Regenerate the patch against
@@ -271,9 +318,10 @@ this version, or use an SDK matching it.
 "@
     }
 
-    & git -C $FlutterRoot apply $PatchFile
-    if ($LASTEXITCODE -ne 0) {
-        Fail "git apply failed with exit code $LASTEXITCODE"
+    $applied = Invoke-Native -FilePath $GitExe `
+        -Arguments @('-C', $FlutterRoot, 'apply', $PatchFile)
+    if ($applied -ne 0) {
+        Fail "git apply failed with exit code $applied"
     }
     Write-Ok 'patch applied'
 }
@@ -289,9 +337,9 @@ if (-not (Test-Path $et)) {
 
 Push-Location (Join-Path $FlutterRoot 'engine\src\flutter')
 try {
-    & $et build -c host_release
-    if ($LASTEXITCODE -ne 0) {
-        Fail "Engine build failed with exit code $LASTEXITCODE"
+    $buildExit = Invoke-Native -FilePath $et -Arguments @('build', '-c', 'host_release')
+    if ($buildExit -ne 0) {
+        Fail "Engine build failed with exit code $buildExit"
     }
 }
 finally {
