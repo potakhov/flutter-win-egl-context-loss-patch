@@ -1,0 +1,215 @@
+diff --git a/engine/src/flutter/shell/platform/windows/egl/egl.cc b/engine/src/flutter/shell/platform/windows/egl/egl.cc
+index 85af46f6858..cbfee7e4b3b 100644
+--- a/engine/src/flutter/shell/platform/windows/egl/egl.cc
++++ b/engine/src/flutter/shell/platform/windows/egl/egl.cc
+@@ -6,6 +6,8 @@
+ 
+ #include <EGL/egl.h>
+ 
++#include <atomic>
++
+ #include "flutter/fml/logging.h"
+ 
+ namespace flutter {
+@@ -13,6 +15,12 @@ namespace egl {
+ 
+ namespace {
+ 
++// Process-wide, because the ANGLE display is process-wide: every context and
++// surface in the process shares it, so a loss affects all of them at once.
++std::atomic<bool> g_context_lost{false};
++std::atomic<bool> g_context_lost_notified{false};
++std::atomic<bool (*)()> g_context_lost_callback{nullptr};
++
+ const char* EGLErrorToString(EGLint error) {
+   switch (error) {
+     case EGL_SUCCESS:
+@@ -52,8 +60,42 @@ const char* EGLErrorToString(EGLint error) {
+ 
+ }  // namespace
+ 
++bool IsContextLost() {
++  return g_context_lost.load(std::memory_order_acquire);
++}
++
++void SetContextLostCallback(bool (*callback)()) {
++  g_context_lost_callback.store(callback, std::memory_order_release);
++}
++
+ void LogEGLError(std::string_view message) {
+   const EGLint error = ::eglGetError();
++
++  // EGL_CONTEXT_LOST is unrecoverable here, and unlike every other error in
++  // this switch it is not a programming mistake - it is the GPU going away
++  // underneath a healthy process (a TDR, a driver reset, an adapter change).
++  // Nothing in this embedder recreates the display afterwards, so the
++  // rasterizer will silently fail to draw for the rest of the process's life
++  // while the engine keeps reporting completed frames. Latch it and tell the
++  // host exactly once, so it can restart rather than sit there frozen.
++  if (error == EGL_CONTEXT_LOST) {
++    // Set the pollable flag first and unconditionally, so a host that polls sees
++    // the loss even if every notification attempt fails.
++    g_context_lost.store(true, std::memory_order_release);
++
++    // Notify once - but only treat it as done once delivery actually succeeded.
++    // A notification dropped here would be permanent, and the host has no other
++    // way to learn of the loss short of asking. A lost context keeps producing
++    // EGL failures, so a later one retries.
++    if (!g_context_lost_notified.exchange(true, std::memory_order_acq_rel)) {
++      const auto callback =
++          g_context_lost_callback.load(std::memory_order_acquire);
++      if (callback == nullptr || !callback()) {
++        g_context_lost_notified.store(false, std::memory_order_release);
++      }
++    }
++  }
++
+   return FML_LOG(ERROR) << "EGL Error: " << EGLErrorToString(error) << " ("
+                         << error << ") " << message;
+ }
+diff --git a/engine/src/flutter/shell/platform/windows/egl/egl.h b/engine/src/flutter/shell/platform/windows/egl/egl.h
+index a0c81a2993c..71500081270 100644
+--- a/engine/src/flutter/shell/platform/windows/egl/egl.h
++++ b/engine/src/flutter/shell/platform/windows/egl/egl.h
+@@ -18,6 +18,28 @@ void LogEGLError(std::string_view file, int line);
+ 
+ #define WINDOWS_LOG_EGL_ERROR LogEGLError(__FILE__, __LINE__);
+ 
++/// Returns true once any EGL call in this process has failed with
++/// EGL_CONTEXT_LOST.
++///
++/// A lost display is permanent: this embedder has no path that recreates the
++/// display, config or contexts (see egl::Manager::CleanUp), so once this
++/// returns true the renderer can never present another frame and the process
++/// must be restarted to recover. Safe to call from any thread.
++bool IsContextLost();
++
++/// Registers a callback invoked when EGL_CONTEXT_LOST is first observed. Pass
++/// nullptr to unregister.
++///
++/// The callback returns whether it actually delivered the notification.
++/// Returning false lets a later EGL failure try again, so one dropped delivery
++/// is not permanent - which matters because a host that misses the notification
++/// has no way to learn of the loss except by polling IsContextLost.
++///
++/// The callback runs on whichever thread observed the loss - in practice the
++/// raster thread, mid-failure - so it must be cheap, non-blocking, and must not
++/// re-enter the engine. Safe to call from any thread.
++void SetContextLostCallback(bool (*callback)());
++
+ }  // namespace egl
+ }  // namespace flutter
+ 
+diff --git a/engine/src/flutter/shell/platform/windows/flutter_windows.cc b/engine/src/flutter/shell/platform/windows/flutter_windows.cc
+index 2e0a0c3c9cf..e18e0de2339 100644
+--- a/engine/src/flutter/shell/platform/windows/flutter_windows.cc
++++ b/engine/src/flutter/shell/platform/windows/flutter_windows.cc
+@@ -7,6 +7,7 @@
+ #include <io.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <cstdlib>
+ #include <filesystem>
+@@ -18,6 +19,7 @@
+ #include "flutter/shell/platform/common/path_utils.h"
+ #include "flutter/shell/platform/embedder/embedder.h"
+ #include "flutter/shell/platform/windows/dpi_utils.h"
++#include "flutter/shell/platform/windows/egl/egl.h"
+ #include "flutter/shell/platform/windows/flutter_project_bundle.h"
+ #include "flutter/shell/platform/windows/flutter_window.h"
+ #include "flutter/shell/platform/windows/flutter_windows_engine.h"
+@@ -254,6 +256,51 @@ HWND FlutterDesktopViewGetHWND(FlutterDesktopViewRef view) {
+   return ViewFromHandle(view)->GetWindowHandle();
+ }
+ 
++namespace {
++
++// Both are process-wide because the ANGLE display they describe is process-wide
++// - see flutter::egl::IsContextLost.
++std::atomic<HWND> g_context_lost_hwnd{nullptr};
++std::atomic<UINT> g_context_lost_message{0};
++
++bool PostGraphicsContextLost() {
++  const HWND hwnd = g_context_lost_hwnd.load(std::memory_order_acquire);
++  const UINT message = g_context_lost_message.load(std::memory_order_acquire);
++  if (hwnd == nullptr || message == 0) {
++    return false;
++  }
++
++  // Post rather than send. This runs on whichever thread first observed the
++  // loss - in practice the raster thread, part way through a failing frame - so
++  // it must not block on the platform thread and must not re-enter the engine.
++  // PostMessage is safe from any thread and returns immediately.
++  //
++  // Report whether it was actually queued. A window torn down mid-teardown, or
++  // a full queue, fails here; saying so lets a later EGL failure retry instead
++  // of leaving the host permanently unaware.
++  return ::PostMessage(hwnd, message, 0, 0) != 0;
++}
++
++}  // namespace
++
++void FlutterDesktopSetGraphicsContextLostNotification(HWND hwnd, UINT message) {
++  g_context_lost_message.store(message, std::memory_order_release);
++  g_context_lost_hwnd.store(hwnd, std::memory_order_release);
++  flutter::egl::SetContextLostCallback(
++      hwnd != nullptr ? &PostGraphicsContextLost : nullptr);
++
++  // A loss that happened before this call has already consumed its one
++  // notification attempt, so report it here instead. This is what makes
++  // registration order irrelevant to the host.
++  if (hwnd != nullptr && message != 0 && flutter::egl::IsContextLost()) {
++    ::PostMessage(hwnd, message, 0, 0);
++  }
++}
++
++bool FlutterDesktopIsGraphicsContextLost() {
++  return flutter::egl::IsContextLost();
++}
++
+ IDXGIAdapter* FlutterDesktopViewGetGraphicsAdapter(FlutterDesktopViewRef view) {
+   auto engine = ViewFromHandle(view)->GetEngine();
+   IDXGIAdapter* adapter;
+diff --git a/engine/src/flutter/shell/platform/windows/public/flutter_windows.h b/engine/src/flutter/shell/platform/windows/public/flutter_windows.h
+index 527566b4ec5..e9c87c25475 100644
+--- a/engine/src/flutter/shell/platform/windows/public/flutter_windows.h
++++ b/engine/src/flutter/shell/platform/windows/public/flutter_windows.h
+@@ -176,6 +176,36 @@ FLUTTER_EXPORT bool FlutterDesktopViewControllerHandleTopLevelWindowProc(
+     LPARAM lparam,
+     LRESULT* result);
+ 
++// ========== Graphics context loss ==========
++
++// Registers |hwnd| to be notified, by a posted |message| with wParam and lParam
++// both zero, the first time the renderer's graphics context is permanently
++// lost. Pass a null |hwnd| to unregister.
++//
++// A context loss is the GPU going away underneath an otherwise healthy process
++// - a TDR, a driver reset or crash, an adapter change. This embedder has no
++// path that recreates the display or contexts afterwards, so the loss is
++// permanent: the rasterizer silently stops drawing while the engine continues
++// to report completed frames and the message loop keeps running. The window
++// therefore freezes with no other outward sign, and only restarting the process
++// recovers it.
++//
++// The message is posted, not sent, and is posted at most once per process. If
++// the context was already lost when this is called, the message is posted
++// immediately, so a late registration cannot miss the event.
++//
++// May be called from any thread.
++FLUTTER_EXPORT void FlutterDesktopSetGraphicsContextLostNotification(
++    HWND hwnd,
++    UINT message);
++
++// Returns true once the renderer's graphics context has been permanently lost.
++//
++// Never returns to false: see
++// |FlutterDesktopSetGraphicsContextLostNotification|. Provided for hosts that
++// prefer to poll rather than handle a message. May be called from any thread.
++FLUTTER_EXPORT bool FlutterDesktopIsGraphicsContextLost();
++
+ // ========== Engine ==========
+ 
+ // Creates a Flutter engine with the given properties.
